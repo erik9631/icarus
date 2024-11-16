@@ -2,6 +2,7 @@ use crossbeam::queue::ArrayQueue;
 use std::cell::Cell;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Condvar, Mutex};
+use std::thread::JoinHandle;
 
 thread_local! {
    static THREAD_LOCAL_ID: Cell<usize> = Cell::new(0);
@@ -9,11 +10,11 @@ thread_local! {
 
 struct Task {
     pub id: usize,
-    pub func: Box<dyn FnOnce() + Send>,
+    pub func: Box<dyn FnOnce(&Executor) + Send>,
 }
 
 impl Task {
-    pub fn new(func: Box<dyn FnOnce() + Send>, id: usize) -> Self {
+    pub fn new(func: Box<dyn FnOnce(&Executor) + Send>, id: usize) -> Self {
         Self { func, id }
     }
 }
@@ -23,17 +24,17 @@ pub struct Executor {
     id_gen: AtomicUsize,
     thread_waker: Condvar,
     waker_mutex: Mutex<bool>,
-    join_handles: Vec<std::thread::JoinHandle<()>>,
+    join_handles: Vec<JoinHandle<()>>,
 }
 impl Executor {
-    fn thread_loop(thread_queues: Vec<ArrayQueue<Task>>, thread_id: usize, thread_waker: &Condvar, waker_mutex: &Mutex<bool>) {
+    fn thread_loop(&self, thread_queues: Vec<ArrayQueue<Task>>, thread_id: usize, thread_waker: &Condvar, waker_mutex: &Mutex<bool>) {
         THREAD_LOCAL_ID.set(thread_id);
         let local_id = THREAD_LOCAL_ID.get();
 
         loop {
             // First take tasks from its own queue
             while let Some(task) = thread_queues[local_id].pop() {
-                (task.func)();
+                (task.func)(&self);
             }
 
             // Then take tasks from other queues
@@ -48,13 +49,13 @@ impl Executor {
             // Park the thread until woken up by a new task
             let waker_guard = waker_mutex.lock().unwrap();
             let state = *waker_guard;
-            let _ = thread_waker
+            let _result = thread_waker
                 .wait_while(waker_guard, |guard| *guard)
                 .expect("Thread waker failed to park");
             // Drain the queue
             if !state {
                 while let Some(task) = thread_queues[local_id].pop() {
-                    (task.func)();
+                    (task.func)(&self);
                 }
                 break;
             }
@@ -73,7 +74,7 @@ impl Executor {
         }
         executor
     }
-    pub fn submit(&self, func: Box<dyn FnOnce() + Send>) -> usize {
+    pub fn submit(&self, func: Box<dyn FnOnce(&Executor) + Send>) -> usize {
         let result = self.id_gen.load(std::sync::atomic::Ordering::Acquire);
         self.thread_queues[THREAD_LOCAL_ID.get()].push(Task::new(func, result)).ok();
         self.thread_waker.notify_all();
@@ -82,11 +83,11 @@ impl Executor {
     }
 
     pub fn close(&mut self) {
-        let mut guard = self.waker_mutex.lock();
+        let mut guard = self.waker_mutex.lock().unwrap();
         *guard = false;
         self.thread_waker.notify_all();
 
-        while let Some(handle) = self.join_handles.pop() {
+        for handle in self.join_handles.drain(..) {
             handle.join().unwrap();
         }
     }
