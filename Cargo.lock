@@ -68,6 +68,6 @@ checksum = "22ec99545bb0ed0ea7bb9b8e1e9122ea386ff8a48c0922e43f36d45ab09e0e80"
 
 [[package]]
 name = "eta-algorithms"
-version = "1.7.0"
+version = "1.7.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92f2b3da9b1982941e280937002e5ba028db2d445266d72912d04db6289355aa"
+checksum = "75e7a79017c9000d3b7909babcee4a0bf49fb0f718cdb61cf1b86884eaa92852"

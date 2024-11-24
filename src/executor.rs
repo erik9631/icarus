@@ -1,4 +1,6 @@
 use crossbeam::queue::ArrayQueue;
+use eta_algorithms::data_structs::bitmap::atomic_bitmap::{AtomicBitmap, Mode};
+use eta_algorithms::data_structs::bitmap::handle::Handle;
 use std::cell::Cell;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Condvar, Mutex};
@@ -26,11 +28,13 @@ pub struct Executor {
     thread_waker: Condvar,
     waker_mutex: Mutex<bool>,
     join_handles: Vec<JoinHandle<()>>,
+    atomic_bitmap: AtomicBitmap,
 }
 
 struct ExecutorPtr(*const Executor);
 unsafe impl Send for ExecutorPtr {}
 impl Executor {
+    const TASK_COUNT: usize = 1024;
     fn thread_loop(executor: ExecutorPtr, thread_id: usize) {
         THREAD_LOCAL_ID.set(thread_id);
         let local_id = THREAD_LOCAL_ID.get();
@@ -81,9 +85,10 @@ impl Executor {
             thread_waker: Condvar::new(),
             waker_mutex: Mutex::new(true),
             join_handles: Vec::with_capacity(thread_count),
+            atomic_bitmap: AtomicBitmap::new(Self::TASK_COUNT * 2),
         });
         for _ in 0..thread_count {
-            executor.thread_queues.push(ArrayQueue::new(1024));
+            executor.thread_queues.push(ArrayQueue::new(Self::TASK_COUNT));
         }
 
         unsafe {
@@ -98,13 +103,16 @@ impl Executor {
         executor
     }
     pub fn submit(&self, func: Box<dyn FnOnce(&Executor) + Send>) -> usize {
-        let result = self.id_gen.load(std::sync::atomic::Ordering::Acquire);
-        println!("Submitting task {} to thread {}", result, THREAD_LOCAL_ID.get());
-        self.thread_queues[THREAD_LOCAL_ID.get()].push(Task::new(func, result)).ok();
+        let generated_id = self.id_gen.load(std::sync::atomic::Ordering::Acquire);
+        println!("Submitting task {} to thread {}", generated_id, THREAD_LOCAL_ID.get());
+        self.atomic_bitmap.set(generated_id, true, Mode::Relaxed);
+        self.thread_queues[THREAD_LOCAL_ID.get()].push(Task::new(func, generated_id)).ok();
         self.thread_waker.notify_all();
         self.id_gen.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        result
+        generated_id
     }
+
+    pub fn yield_until(&self, handle: Handle) {}
 
     pub fn close(&mut self) {
         let mut guard = self.waker_mutex.lock().unwrap();
