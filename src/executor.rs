@@ -28,9 +28,16 @@ pub struct Executor {
     thread_waker: Condvar,
     waker_mutex: Mutex<bool>,
     join_handles: Vec<JoinHandle<()>>,
-    atomic_bitmap: AtomicBitmap,
+    task_states: AtomicBitmap,
 }
 
+// TODO: Make a reactive thread
+// We need to make a reactive thread to which you can register a waker.
+// The waker will be nothing but a barrier (So a condvar)
+// The execution threads will communicate with the main thread and they will push messages (Not tasks) onto the reactive thread.
+// The reactive thread will wake the waker if it receives the correct message with the correct value.
+// Generally the reactive thread could be responsible for the futures so maybe we don't even need an atomic bitmap.
+// consider introducing a flag for if the task was stolen or not. Only stolen tasks need to go through the reactive thread.
 struct ExecutorPtr(*const Executor);
 unsafe impl Send for ExecutorPtr {}
 impl Executor {
@@ -64,8 +71,9 @@ impl Executor {
             let waker_guard = waker_mutex.lock().unwrap();
             let state = *waker_guard;
             let _result = thread_waker
-                .wait_while(waker_guard, |guard| *guard)
+                .wait_while(waker_guard, |guard| *guard || thread_queues[local_id].is_empty())
                 .expect("Thread waker failed to park");
+
             // Drain the queue
             if !state {
                 println!("Thread loop {} draining", thread_id);
@@ -85,7 +93,7 @@ impl Executor {
             thread_waker: Condvar::new(),
             waker_mutex: Mutex::new(true),
             join_handles: Vec::with_capacity(thread_count),
-            atomic_bitmap: AtomicBitmap::new(Self::TASK_COUNT * 2),
+            task_states: AtomicBitmap::new(Self::TASK_COUNT * 2),
         });
         for _ in 0..thread_count {
             executor.thread_queues.push(ArrayQueue::new(Self::TASK_COUNT));
@@ -105,9 +113,11 @@ impl Executor {
     pub fn submit(&self, func: Box<dyn FnOnce(&Executor) + Send>) -> usize {
         let generated_id = self.id_gen.load(std::sync::atomic::Ordering::Acquire);
         println!("Submitting task {} to thread {}", generated_id, THREAD_LOCAL_ID.get());
-        self.atomic_bitmap.set(generated_id, true, Mode::Relaxed);
+        self.task_states.set(generated_id, true, Mode::Relaxed);
         self.thread_queues[THREAD_LOCAL_ID.get()].push(Task::new(func, generated_id)).ok();
+        let guard = self.waker_mutex.lock().unwrap();
         self.thread_waker.notify_all();
+        drop(guard);
         self.id_gen.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         generated_id
     }
