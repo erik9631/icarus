@@ -1,0 +1,17 @@
+[package]
+name = "async_prototype"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+crossbeam = "0.8.4"
+eta-algorithms = "1.7.0"
+
+
+[[bin]]
+name = "async_prototype"
+path = "src/main.rs"
+
+[lib]
+name = "async_prototype"
+path = "src/lib.rs"

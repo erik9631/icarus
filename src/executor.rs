@@ -20,6 +20,7 @@ impl Task {
 }
 
 pub struct Executor {
+    // Refactor make your own interior mutability wrapper so threads can share this without unsafe and with move semantics
     thread_queues: Vec<ArrayQueue<Task>>,
     id_gen: AtomicUsize,
     thread_waker: Condvar,
@@ -27,10 +28,10 @@ pub struct Executor {
     join_handles: Vec<JoinHandle<()>>,
 }
 
-struct UnsafePtrExecutor(*const Executor);
-unsafe impl Send for UnsafePtrExecutor {}
+struct ExecutorPtr(*const Executor);
+unsafe impl Send for ExecutorPtr {}
 impl Executor {
-    fn thread_loop(executor: UnsafePtrExecutor, thread_id: usize) {
+    fn thread_loop(executor: ExecutorPtr, thread_id: usize) {
         THREAD_LOCAL_ID.set(thread_id);
         let local_id = THREAD_LOCAL_ID.get();
         println!("Thread loop {} started", thread_id);
@@ -87,7 +88,7 @@ impl Executor {
 
         unsafe {
             for i in 0..thread_loops {
-                let executor_ptr = UnsafePtrExecutor(&*executor as *const Executor);
+                let executor_ptr = ExecutorPtr(&*executor as *const Executor);
                 let id = i + 1;
                 executor
                     .join_handles
@@ -110,8 +111,8 @@ impl Executor {
         *guard = false;
         self.thread_waker.notify_all();
         drop(guard);
-        //Close should yield till empty
-        let executor_ptr = UnsafePtrExecutor(&*self as *const Executor);
+        //Close yields till empty
+        let executor_ptr = ExecutorPtr(&*self as *const Executor);
         Self::thread_loop(executor_ptr, 0);
 
         for handle in self.join_handles.drain(..) {
