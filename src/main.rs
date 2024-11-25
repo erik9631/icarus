@@ -26,5 +26,5 @@ fn main() {
     executor.submit(Box::new(async_function));
     executor.submit(Box::new(async_function2));
     executor.submit(Box::new(move |executor: &Executor| async_function_nested(executor, param)));
-    executor.close();
+    executor.end();
 }
