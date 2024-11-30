@@ -75,6 +75,7 @@ pub struct Executor {
     id_gen: AtomicUsize,
     thread_wakers: Vec<Waker>,
     join_handles: Vec<JoinHandle<()>>,
+    reactive_thread_handle: Option<JoinHandle<()>>,
     quit: AtomicBool,
     reactive_sender: Sender<Message>,
 }
@@ -110,6 +111,7 @@ impl Executor {
                     task_states.set(task, true);
                     for wake_data in wait_data_vec.iter() {
                         if task_states.check_batch(wake_data.handle.as_slice()) {
+                            println!("Reactive thread waking up thread {}", wake_data.thread_id);
                             thread_wakers[wake_data.thread_id].wake(i32::MAX);
                         }
                     }
@@ -120,6 +122,7 @@ impl Executor {
                 }
             }
         }
+        println!("Reactive thread quitting");
     }
     fn thread_loop(executor: ExecutorPtr, thread_id: usize) {
         THREAD_LOCAL_ID.set(thread_id);
@@ -152,29 +155,32 @@ impl Executor {
             }
 
             // Park the thread until woken up by a new task
-            if thread_queues[local_id].is_empty() {
+            let quit = quit.load(Acquire);
+            if thread_queues[local_id].is_empty() && !quit {
                 thread_waker.wait();
             }
 
             // Drain the queue
-            if !quit.load(Acquire) {
+            if quit {
                 println!("Thread loop {} draining", thread_id);
                 while let Some(task) = thread_queues[local_id].pop() {
                     (task.func)(&executor);
                 }
-                println!("Thread loop {} finished", thread_id);
+                println!("Thread {} quit", thread_id);
                 break;
             }
         }
     }
     pub fn new(thread_count: usize) -> Box<Self> {
-        let thread_loops = thread_count - 1;
+        // -1 one because the main thread is also a executor thread and not part of the loop
+        let threads_to_create = thread_count - 1;
         let mut thread_wakers = Vec::with_capacity(thread_count);
         let (reactive_sender, reactive_receiver) = unbounded::<Message>();
 
         let mut executor = Box::new(Self {
             thread_queues: Vec::with_capacity(thread_count),
             id_gen: AtomicUsize::new(0),
+            reactive_thread_handle: None,
             join_handles: Vec::with_capacity(thread_count),
             thread_wakers,
             quit: AtomicBool::new(false),
@@ -191,7 +197,7 @@ impl Executor {
 
         // Spin up the executor threads
         unsafe {
-            for i in 0..thread_loops {
+            for i in 0..threads_to_create {
                 let executor_ptr = ExecutorPtr(&*executor as *const Executor);
                 let id = i + 1;
                 executor
@@ -203,9 +209,7 @@ impl Executor {
         // Spin up the reactive thread
         unsafe {
             let executor_ptr = ExecutorPtr(&*executor as *const Executor);
-            executor
-                .join_handles
-                .push(std::thread::spawn(|| Self::reactive_thread_loop(executor_ptr, reactive_receiver)));
+            executor.reactive_thread_handle = Some(std::thread::spawn(|| Self::reactive_thread_loop(executor_ptr, reactive_receiver)));
         }
 
         executor
@@ -286,5 +290,7 @@ impl Executor {
         for handle in self.join_handles.drain(..) {
             handle.join().unwrap();
         }
+        self.reactive_sender.send(Message::Quit).expect("Failed to send quit message");
+        self.reactive_thread_handle.take().unwrap().join().unwrap();
     }
 }
