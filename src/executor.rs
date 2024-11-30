@@ -80,13 +80,14 @@ pub struct Executor {
     reactive_sender: Sender<Message>,
 }
 
-// TODO: Make a reactive thread
-// We need to make a reactive thread to which you can register a waker.
-// The waker will be nothing but a barrier (So a condvar)
-// The execution threads will communicate with the main thread and they will push messages (Not tasks) onto the reactive thread.
-// The reactive thread will wake the waker if it receives the correct message with the correct value.
-// Generally the reactive thread could be responsible for the futures so maybe we don't even need an atomic bitmap.
-// consider introducing a flag for if the task was stolen or not. Only stolen tasks need to go through the reactive thread.
+// OPTIMIZE:
+// Every task shall point towards its bitmap chunk. It already does this with the id as id is offset to the bitmap chunk.
+// We will use an atomic bitmap instead.
+// This will decentralize the bitmap into tasks
+// This means multiple tasks can point towards the same bitmap chunk
+// Each task will write its state into this bitmap chunk once finished
+// This will remove the need of having TaskFinished messages in the reactive thread
+//   But we still need a way to notify the wakers that the task is finished
 struct ExecutorPtr(*const Executor);
 unsafe impl Send for ExecutorPtr {}
 impl Executor {
@@ -139,6 +140,7 @@ impl Executor {
             while let Some(task) = thread_queues[local_id].pop() {
                 (task.func)(&executor);
                 // Notify the reactive thread that the task is finished
+                // This should be done by waking up the original thread the task was stolen from instead of messaging
                 sender
                     .send(Message::TaskFinished(task.id))
                     .expect("Failed to send finished message");
@@ -155,6 +157,7 @@ impl Executor {
             }
 
             // Park the thread until woken up by a new task
+            // TODO Use thread::park instead of cond vars
             let quit = quit.load(Acquire);
             if thread_queues[local_id].is_empty() && !quit {
                 thread_waker.wait();
@@ -220,6 +223,7 @@ impl Executor {
             waker.wake(THREAD_LOCAL_ID.get() as i32);
         }
     }
+    //Returns the id of the task, this can be used to construct a custom handle for awaits (Based on the tasks we want to await for)
     pub fn submit(&self, func: Box<dyn FnOnce(&Executor) + Send>) -> usize {
         let generated_id = self.id_gen.load(Acquire);
         println!("Submitting task {} to thread {}", generated_id, THREAD_LOCAL_ID.get());
@@ -232,6 +236,7 @@ impl Executor {
         generated_id
     }
 
+    // The handles are optimally constructed (So if 10 tasks are within the usize range, we can use a single handle)
     pub fn yield_until(&self, handles: Vec<Handle>) {
         let thread_queues = &self.thread_queues;
         let waker = &self.thread_wakers[THREAD_LOCAL_ID.get()];
@@ -244,6 +249,7 @@ impl Executor {
             }))
             .expect("Failed to send message");
 
+        // We will loop until the handles in the params compared to the bitmap are all true
         loop {
             // First take tasks from its own queue
             while let Some(task) = thread_queues[local_id].pop() {
@@ -269,7 +275,11 @@ impl Executor {
                 }
             }
 
-            // Park the thread until woken up by finished task or new task.
+            // This means that all local tasks were finished, here we should check the params compared to the bitmap if are all true
+            // If not then we park the thread and submit a waker to the reactive thread with the
+            // Threads that stole the tasks shall unpark the original thread they stole from
+            // After being unparked here we should check again against the bitmap
+            // We need to differentiate between awaking for new tasks vs waker task
             if thread_queues[local_id].is_empty() {
                 if waker.wait() == i32::MAX {
                     break;
