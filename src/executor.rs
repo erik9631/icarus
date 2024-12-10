@@ -7,7 +7,9 @@ use std::cell::Cell;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize};
 use std::sync::{Condvar, Mutex};
+use std::thread;
 use std::thread::JoinHandle;
+use eta_algorithms::data_structs::bitmap::atomic_bitmap::{AtomicBitmap, Mode};
 
 thread_local! {
    static THREAD_LOCAL_ID: Cell<usize> = Cell::new(0);
@@ -54,18 +56,17 @@ impl Waker {
 }
 
 struct Task {
-    pub id: usize,
+    pub task_id: usize,
     pub func: Box<dyn FnOnce(&Executor) + Send>,
-    stolen: bool,
+    pub src_id: usize, //Src of the original thread the task was submitted to
 }
 
 impl Task {
     pub fn steal(mut self) -> Self {
-        self.stolen = true;
         self
     }
     pub fn new(func: Box<dyn FnOnce(&Executor) + Send>, id: usize) -> Self {
-        Self { func, id, stolen: false }
+        Self { func, task_id: id, src_id: THREAD_LOCAL_ID.get() }
     }
 }
 
@@ -73,8 +74,8 @@ pub struct Executor {
     // Refactor make your own interior mutability wrapper so threads can share this without unsafe and with move semantics
     thread_queues: Vec<ArrayQueue<Task>>,
     id_gen: AtomicUsize,
-    thread_wakers: Vec<Waker>,
     join_handles: Vec<JoinHandle<()>>,
+    task_state: AtomicBitmap,
     reactive_thread_handle: Option<JoinHandle<()>>,
     quit: AtomicBool,
     reactive_sender: Sender<Message>,
@@ -87,7 +88,7 @@ pub struct Executor {
 // This means multiple tasks can point towards the same bitmap chunk
 // Each task will write its state into this bitmap chunk once finished
 // This will remove the need of having TaskFinished messages in the reactive thread
-//   But we still need a way to notify the wakers that the task is finished
+// But we still need a way to notify the wakers that the task is finished
 struct ExecutorPtr(*const Executor);
 unsafe impl Send for ExecutorPtr {}
 impl Executor {
@@ -98,25 +99,9 @@ impl Executor {
         let mut task_states = Bitmap::new(Self::TASK_COUNT * 2);
         let executor = unsafe { &*executor_ptr.0 };
         let mut wait_data_vec = Vec::new();
-        let thread_wakers = executor.thread_wakers.as_slice();
-
         loop {
             let message = r.recv().expect("Failed to receive message");
             match message {
-                Message::WakeOnHandleComplete(wake_data) => {
-                    println!("Reactive thread received wake on handle complete");
-                    wait_data_vec.push(wake_data);
-                }
-                Message::TaskFinished(task) => {
-                    println!("Reactive thread received task finished");
-                    task_states.set(task, true);
-                    for wake_data in wait_data_vec.iter() {
-                        if task_states.check_batch(wake_data.handle.as_slice()) {
-                            println!("Reactive thread waking up thread {}", wake_data.thread_id);
-                            thread_wakers[wake_data.thread_id].wake(i32::MAX);
-                        }
-                    }
-                }
                 Message::Quit => {
                     println!("Reactive thread received quit");
                     break;
@@ -131,25 +116,26 @@ impl Executor {
         println!("Thread loop {} started", thread_id);
         let executor = unsafe { &*executor.0 };
         let thread_queues = &executor.thread_queues;
-        let thread_waker = &executor.thread_wakers[local_id];
         let quit = &executor.quit;
+        let thread_handles = &executor.join_handles;
+        let task_states = &executor.task_state;
         let sender = &executor.reactive_sender;
 
         loop {
             // First take tasks from its own queue
             while let Some(task) = thread_queues[local_id].pop() {
                 (task.func)(&executor);
-                // Notify the reactive thread that the task is finished
-                // This should be done by waking up the original thread the task was stolen from instead of messaging
-                sender
-                    .send(Message::TaskFinished(task.id))
-                    .expect("Failed to send finished message");
+                task_states.set(task.task_id, true, Mode::Relaxed);
+                // Unpark the original thread the task was stolen from
+                if task.src_id != local_id {
+                    thread_handles[task.src_id].thread().unpark();
+                }
             }
 
             // Then take tasks from other queues
             for queue in thread_queues.iter() {
                 if let Some(task) = queue.pop() {
-                    println!("Thread {} stealing task {} to queue", thread_id, task.id);
+                    println!("Thread {} stealing task {} to queue", thread_id, task.task_id);
                     if let Err(_) = thread_queues[local_id].push(task) {
                         panic!("Failed to push to local queue");
                     }
@@ -157,10 +143,10 @@ impl Executor {
             }
 
             // Park the thread until woken up by a new task
-            // TODO Use thread::park instead of cond vars
             let quit = quit.load(Acquire);
             if thread_queues[local_id].is_empty() && !quit {
-                thread_waker.wait();
+                //TODO Possible issue with atomicity. What if unpark is called before the thread is parked?
+                thread::park();
             }
 
             // Drain the queue
@@ -177,22 +163,17 @@ impl Executor {
     pub fn new(thread_count: usize) -> Box<Self> {
         // -1 one because the main thread is also a executor thread and not part of the loop
         let threads_to_create = thread_count - 1;
-        let mut thread_wakers = Vec::with_capacity(thread_count);
         let (reactive_sender, reactive_receiver) = unbounded::<Message>();
 
         let mut executor = Box::new(Self {
+            task_state: AtomicBitmap::new(2048),
             thread_queues: Vec::with_capacity(thread_count),
             id_gen: AtomicUsize::new(0),
             reactive_thread_handle: None,
             join_handles: Vec::with_capacity(thread_count),
-            thread_wakers,
             quit: AtomicBool::new(false),
             reactive_sender,
         });
-
-        for _ in 0..thread_count {
-            executor.thread_wakers.push(Waker::new());
-        }
 
         for _ in 0..thread_count {
             executor.thread_queues.push(ArrayQueue::new(Self::TASK_COUNT));
@@ -205,22 +186,22 @@ impl Executor {
                 let id = i + 1;
                 executor
                     .join_handles
-                    .push(std::thread::spawn(move || Self::thread_loop(executor_ptr, id)));
+                    .push(thread::spawn(move || Self::thread_loop(executor_ptr, id)));
             }
         }
 
         // Spin up the reactive thread
         unsafe {
             let executor_ptr = ExecutorPtr(&*executor as *const Executor);
-            executor.reactive_thread_handle = Some(std::thread::spawn(|| Self::reactive_thread_loop(executor_ptr, reactive_receiver)));
+            executor.reactive_thread_handle = Some(thread::spawn(|| Self::reactive_thread_loop(executor_ptr, reactive_receiver)));
         }
 
         executor
     }
 
     fn wake_all(&self) {
-        for waker in self.thread_wakers.iter() {
-            waker.wake(THREAD_LOCAL_ID.get() as i32);
+        for handle in self.join_handles.iter() {
+            handle.thread().unpark();
         }
     }
     //Returns the id of the task, this can be used to construct a custom handle for awaits (Based on the tasks we want to await for)
@@ -239,7 +220,7 @@ impl Executor {
     // The handles are optimally constructed (So if 10 tasks are within the usize range, we can use a single handle)
     pub fn yield_until(&self, handles: Vec<Handle>) {
         let thread_queues = &self.thread_queues;
-        let waker = &self.thread_wakers[THREAD_LOCAL_ID.get()];
+        let join_handles = &self.join_handles;
         let local_id = THREAD_LOCAL_ID.get();
         // Notify the reactive thread that it should wake us up when the handles are done
         self.reactive_sender
@@ -251,40 +232,36 @@ impl Executor {
 
         // We will loop until the handles in the params compared to the bitmap are all true
         loop {
+
             // First take tasks from its own queue
             while let Some(task) = thread_queues[local_id].pop() {
                 (task.func)(&self);
-                // Notify the reactive thread that the task is finished
-                self.reactive_sender
-                    .send(Message::TaskFinished(task.id))
-                    .expect("Failed to send finished message");
-
-                // If reactive thread woke us up, that means our tasks are finished and we can return execution to the user
-                if waker.wake_src() == i32::MAX {
-                    break;
+                if task.task_id != THREAD_LOCAL_ID.get() {
+                    join_handles[task.src_id].thread().unpark();
                 }
             }
 
             // Then take tasks from other queues
             for queue in thread_queues.iter() {
                 if let Some(task) = queue.pop() {
-                    println!("Thread {} stealing task {} to queue", local_id, task.id);
+                    println!("Thread {} stealing task {} to queue", local_id, task.task_id);
                     if let Err(_) = thread_queues[local_id].push(task) {
                         panic!("Failed to push to local queue");
                     }
                 }
             }
 
-            // This means that all local tasks were finished, here we should check the params compared to the bitmap if are all true
-            // If not then we park the thread and submit a waker to the reactive thread with the
-            // Threads that stole the tasks shall unpark the original thread they stole from
-            // After being unparked here we should check again against the bitmap
-            // We need to differentiate between awaking for new tasks vs waker task
-            if thread_queues[local_id].is_empty() {
-                if waker.wait() == i32::MAX {
-                    break;
-                }
+
+            if !self.task_state.check_batch(handles.as_slice(), Mode::Relaxed) {
+                thread::park();
             }
+
+            // After unparking we do one more check if the tasks were done and if yes we prioritize yielding to the original code, otherwise we try to do more work
+            if !self.task_state.check_batch(handles.as_slice(), Mode::Relaxed) {
+                break;
+            }
+
+
         }
     }
 
